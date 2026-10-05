@@ -10,6 +10,8 @@ dependencies = [
     "pyperclip>=1.8",
     "mcp>=1.0",
     "pycaw>=20240210",
+    "rapidfuzz>=3.6",
+    "apscheduler>=3.10,<4",
 ]
 
 [project.optional-dependencies]

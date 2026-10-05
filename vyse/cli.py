@@ -53,8 +53,7 @@ class App:
 
     def _notify(self, text: str) -> None:
         """Background tasks and reminders print here (from worker threads)."""
-        self.console.print(f"
-[magenta]{text}[/magenta]", highlight=False)
+        self.console.print(f"\n[magenta]{text}[/magenta]", highlight=False)
 
     def startup(self) -> None:
         """Warm the slow services in the background so the first request is fast."""
@@ -119,8 +118,7 @@ class App:
         elif cmd == "/undo":
             n = int(arg) if arg.strip().isdigit() else 1
             done, problems = self.ctx.journal.undo(steps=n)
-            c.print(f"Reverted {len(done)} item(s)." + "".join(f"
-  [yellow]{p}[/yellow]" for p in problems))
+            c.print(f"Reverted {len(done)} item(s)." + "".join(f"\n  [yellow]{p}[/yellow]" for p in problems))
         elif cmd == "/tasks":
             rows = self.ctx.tasks.list()
             t = Table("id", "task", "status", "seconds")

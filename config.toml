@@ -68,7 +68,7 @@ path = "%LOCALAPPDATA%\\Medal\\Medal.exe"
 
 [apps.valorant]
 aliases = ["valorant"]
-process = "RiotClientServices.exe"   # the Riot client starts first; the game follows
+process = "VALORANT-Win64-Shipping.exe"   # the GAME process (not the Riot client, which is often already open and would make Vyse think Valorant is running)
 path = "C:\\Riot Games\\Riot Client\\RiotClientServices.exe"
 args = ["--launch-product=valorant", "--launch-patchline=live"]
 
@@ -107,3 +107,38 @@ path = "notepad.exe"
 [google]
 enabled = true               # tools only register if credentials.json exists in data_dir
 
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+[features]
+app_scan = true               # detect installed apps (Start Menu, App Paths, Store apps) and fuzzy-match "open ..." requests
+app_scan_ttl_hours = 12
+cache_enabled = true          # reuse results of read-only tools (system info, searches) for a short time
+cache_max_entries = 256
+scheduler_enabled = true      # reminders / scheduled tasks (persisted in the database; fire only while Vyse is running)
+metrics_enabled = true        # latency / failure / token statistics (see /stats)
+metrics_retention_days = 30
+
+[index]                       # fast file search: find_files answers from this index instead of walking folders
+enabled = true
+roots = ["~/Desktop", "~/Documents", "~/Downloads"]
+max_files = 400000
+stale_minutes = 30
+
+# Explicit permission per tool: safe | confirmation | blocked. Overrides can only make a tool STRICTER.
+[permissions]
+# run_command = "blocked"
+# open_path = "confirmation"
+
+# Deterministic organize rules (first match wins). Without any, built-in defaults are used.
+# [[organize.rules]]
+# name = "Screenshots"
+# dest = "Images/Screenshots"
+# ext = ["png", "jpg"]
+# name_contains = ["screenshot"]
+#
+# [[organize.rules]]
+# name = "Old big files"
+# dest = "Archive"
+# min_size_mb = 500
+# older_than_days = 180

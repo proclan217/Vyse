@@ -45,7 +45,7 @@ Switching models is just `/model qwen3:8b` or `[model] name = ...`; the agent ta
 ## Tools
 
 - **Files**: find_files, list_dir, read_file, file_info, move, copy, make_dir, trash
-- **Organize**: plan_organize (dry run) → apply_plan → undo_last; strategies by_type / by_date / by_name
+- **Organize**: plan_organize (dry run) → apply_plan → undo_last / undo / undo_history; strategies by_rules (default) / by_type / by_date / by_name
 - **Notes**: create_note, append_note, search_notes, read_note (Markdown with front matter)
 - **Memory**: remember, recall, forget (SQLite + FTS5; only relevant facts are injected each turn; old chat is rolled into a summary)
 - **System**: open_app, open_path, get_running_apps, system_info, CPU/RAM/GPU/disk, volume, current time, clipboard, run_command
@@ -87,6 +87,41 @@ trusted_tools = ["read_file"]
 ```
 
 Tools appear as `fs__read_file`. Anything not in `trusted_tools` is risky (confirmation required).
+
+## Reliability, speed and automation features
+
+**Tool calls are checked before they run**
+- *Validation*: every tool name and argument the model produces is checked against the tool's schema (required fields, types, enums, unknown arguments). Harmless slips are fixed (`"3"` -> `3`, wrong case); everything else is rejected.
+- *Repair*: malformed JSON arguments (single quotes, trailing commas, code fences, unclosed braces, bad Windows-path escapes) and misspelled tool names are repaired automatically before the call is retried.
+- *Structured errors*: a failed call returns `{ok:false, error_type, retryable, hint, expected, suggestions}` so the model can correct itself instead of giving up.
+- *Chaining*: one model step may contain several dependent calls; later calls reference earlier results with `$1.path` / `${2.info.size}`. A call whose dependency failed is skipped, not run with garbage.
+- *Parallel execution*: independent read-only calls in one step run concurrently (thread pool driven by asyncio) with a per-call timeout (`[agent] tool_timeout`).
+
+**Fuzzy matching (RapidFuzz)**: app names, files, folders and process names tolerate typos. Corrections are applied automatically only for read-only lookups (reading, listing, opening an app), and a corrected path is re-checked by the safety policy. Write operations never guess: they fail with "did you mean ...?" suggestions. Very short queries are never fuzzy-matched and near-ties are reported as ambiguous.
+
+**App launcher**: Vyse scans the Start Menu, App Paths and Store apps (cached, refreshed in the background, `/apps` lists them), then fuzzy-matches the request. Your `[apps.*]` entries still win.
+
+**Permissions and confirmation**: every tool has a permission: `safe` (just runs), `confirmation` (asks first) or `blocked` (never runs). Defaults derive from the tool's risk; `[permissions]` in the config can only make a tool stricter. *Destructive* tools (`trash`, `kill_process`) always ask, even with `/yes`. Critical system processes and Vyse itself cannot be killed. Scheduled and background runs are unattended, so anything that would need a confirmation is declined and the task is reported as failed.
+
+**Undo**: every file operation is written to a transaction log (the undo journal). `/history` (or `undo_history`) lists it; `/undo [n]` or the `undo` tool reverses the last *n* transactions or one by id. "Deleting" is a move to Vyse's trash, so it is recoverable.
+
+**Fast file search**: `find_files` is answered from a SQLite index of your configured roots (built in the background, refreshed when stale; protected folders are never indexed). Results are verified against the disk and typos fall back to fuzzy name matching. If the index is not ready the tool falls back to a live scan. `/index [rebuild]`.
+
+**File organization**: deterministic Python rules (no model involved), same folder in, same plan out, plus your own `[[organize.rules]]` (extension, name text/regex, size, age). Always dry-run first, then apply, then undo if you like.
+
+**Memory**: SQLite + FTS5. Facts have a kind and an importance; finished tasks are recorded too. Each turn only the memories relevant to the request (ranked, typo-tolerant, within a size budget) are injected, never the whole history.
+
+**Context manager**: the prompt is kept under `[agent] context_tokens`: old tool results shrink first, then the oldest turns drop; huge tool results are compacted before the model sees them.
+
+**Tool-result cache**: read-only tools (system info, CPU/RAM, listings) declare a TTL; results are reused until they expire or a write tool that could change them runs. `/cache [clear]`.
+
+**Background tasks**: `start_background_task` runs a tool or routine in a worker thread and returns immediately; you are notified when it finishes. `/tasks`, `list_background_tasks`, `background_task_status`, `cancel_background_task`.
+
+**Scheduling and reminders**: `set_reminder` and `schedule_task` (once / interval / daily / cron) are stored in SQLite and run by APScheduler. **Limitation:** jobs fire only while Vyse is running. The scheduler is rebuilt from the database at each start; one-shot reminders that came due while Vyse was closed are reported (not run) at the next start. Firing while Vyse is closed would need Windows Task Scheduler, which is not set up. `/schedules`.
+
+**Observability**: model latency (p50/p95), tool latency, failures by error type, token usage, routing decisions and command success are stored in a local SQLite database and shown by `/stats [hours]` or the `vyse_stats` tool. Retention: `metrics_retention_days`.
+
+New slash commands: `/stats /history /undo /tasks /schedules /index /apps /cache`. New config sections: `[features]`, `[index]`, `[permissions]`, `[[organize.rules]]`, and more `[agent]` keys (`max_calls_per_step`, `context_tokens`, `tool_result_chars`, `tool_timeout`, `relevant_memories`, `parallel_tools`, `max_parallel`).
 
 ## Tests
 
