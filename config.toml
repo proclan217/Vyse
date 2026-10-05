@@ -1,0 +1,109 @@
+# Vyse configuration. Environment variables like %USERPROFILE% and ~ are expanded.
+
+[model]
+# Hosted on NVIDIA NIM (OpenAI-compatible). Set your key once:  setx NVIDIA_API_KEY "nvapi-..."   (never put it in this file)
+provider = "openai"          # "openai" = hosted API below; "ollama" = local models (then use ollama_url / num_gpu)
+name = "nvidia/nemotron-3.5-lightning-30b-a3b"   # fastest 30B-A3B MoE on build.nvidia.com, built for agentic tool use
+base_url = "https://integrate.api.nvidia.com/v1"
+api_key_env = "NVIDIA_API_KEY"
+rpm_limit = 38               # NVIDIA free tier = 40 requests/min; Vyse waits instead of failing
+think = false                # reasoning off = fast tool calls
+temperature = 0.3
+num_predict = 400            # cap on generated tokens
+timeout = 60
+# --- local Ollama settings (only used when provider = "ollama") ---
+ollama_url = "http://localhost:11434"
+num_ctx = 3072
+num_gpu = 0
+
+[agent]
+max_steps = 8
+history_messages = 4         # recent messages kept verbatim (small context = fast)
+summarize_after = 12
+relevant_facts = 5
+max_tools_per_turn = 8
+
+[paths]
+data_dir = "%USERPROFILE%\\.vyse"
+notes_dir = "%USERPROFILE%\\Documents\\VyseNotes"
+# Where Vyse may write/move files. Everything else needs confirmation or is blocked.
+allowed_roots = [
+    "%USERPROFILE%\\Desktop",
+    "%USERPROFILE%\\Documents",
+    "%USERPROFILE%\\Downloads",
+    "%USERPROFILE%\\Desktop\\Vyse",
+]
+# Where Vyse may read/search (superset is fine).
+read_roots = [
+    "%USERPROFILE%",
+]
+protected_paths = [
+    "C:\\Windows",
+    "C:\\Program Files",
+    "C:\\Program Files (x86)",
+    "C:\\ProgramData",
+    "%USERPROFILE%\\AppData",
+    "%USERPROFILE%\\.ssh",
+]
+
+[policy]
+# Organizing more than this many files needs confirmation.
+organize_confirm_threshold = 25
+# "risky" = always ask, "write" = ask only outside allowed roots, "safe" = never ask.
+confirm_risky = true
+auto_yes = false             # same as /yes; confirms everything EXCEPT blocked actions
+
+# Frequently used apps. Add your own: name = { path = "...", aliases = [...] , process = "x.exe" }
+# If path is omitted Vyse tries the Start Menu and PATH.
+[apps.discord]
+aliases = ["discord"]
+process = "Discord.exe"
+path = "%LOCALAPPDATA%\\Discord\\Update.exe"
+args = ["--processStart", "Discord.exe"]
+
+[apps.medal]
+aliases = ["medal"]
+process = "Medal.exe"
+path = "%LOCALAPPDATA%\\Medal\\Medal.exe"
+
+[apps.valorant]
+aliases = ["valorant"]
+process = "RiotClientServices.exe"   # the Riot client starts first; the game follows
+path = "C:\\Riot Games\\Riot Client\\RiotClientServices.exe"
+args = ["--launch-product=valorant", "--launch-patchline=live"]
+
+[apps.chrome]
+aliases = ["chrome", "google chrome", "browser"]
+process = "chrome.exe"
+
+[apps.steam]
+aliases = ["steam"]
+process = "steam.exe"
+
+[apps.spotify]
+aliases = ["spotify"]
+process = "Spotify.exe"
+
+[apps.obsidian]
+aliases = ["obsidian"]
+process = "Obsidian.exe"
+
+[apps.explorer]
+aliases = ["explorer", "file explorer", "files", "windows explorer"]
+path = "explorer.exe"
+
+[apps.notepad]
+aliases = ["notepad"]
+process = "notepad.exe"
+path = "notepad.exe"
+
+# MCP servers (stdio). Tools are "risky" unless listed in trusted_tools.
+# [[mcp.servers]]
+# name = "fs"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\procl\\Documents"]
+# trusted_tools = ["read_file", "list_directory"]
+
+[google]
+enabled = true               # tools only register if credentials.json exists in data_dir
+
