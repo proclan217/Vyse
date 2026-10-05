@@ -16,6 +16,10 @@ class Fact:
     text: str
     tags: str
     created_at: float
+    kind: str = "fact"           # fact | preference | context
+    importance: int = 1          # 1 normal, 2 important, 3 pinned-worthy
+    uses: int = 0                # how often retrieval surfaced it (a cheap usefulness signal)
+    last_used: float = 0.0
 
 
 _STOP = set("a an the is are was were be to of in on at for and or my me i you your what which who do does did "
@@ -49,6 +53,19 @@ class Memory:
         CREATE TABLE IF NOT EXISTS routines(
             name TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '',
             steps TEXT NOT NULL, created_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS task_history(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, request TEXT NOT NULL, outcome TEXT NOT NULL DEFAULT '',
+            tools TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL);
+        CREATE VIRTUAL TABLE IF NOT EXISTS task_fts USING fts5(
+            request, outcome, tools, content='task_history', content_rowid='id');
+        CREATE TRIGGER IF NOT EXISTS task_ai AFTER INSERT ON task_history BEGIN
+            INSERT INTO task_fts(rowid,request,outcome,tools) VALUES (new.id,new.request,new.outcome,new.tools); END;
+        CREATE TRIGGER IF NOT EXISTS task_ad AFTER DELETE ON task_history BEGIN
+            INSERT INTO task_fts(task_fts,rowid,request,outcome,tools) VALUES('delete',old.id,old.request,old.outcome,old.tools); END;
+        CREATE TABLE IF NOT EXISTS schedules(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL, spec TEXT NOT NULL,
+            action TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL,
+            last_run REAL, runs INTEGER NOT NULL DEFAULT 0, last_result TEXT NOT NULL DEFAULT '');
         CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
             key, text, tags, content='facts', content_rowid='id');
         CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
@@ -59,18 +76,31 @@ class Memory:
             INSERT INTO facts_fts(facts_fts,rowid,key,text,tags) VALUES('delete',old.id,old.key,old.text,old.tags);
             INSERT INTO facts_fts(rowid,key,text,tags) VALUES (new.id,new.key,new.text,new.tags); END;
         """)
+        self._migrate()
         self.db.commit()
 
+    def _migrate(self) -> None:
+        """Databases created before kind/importance/uses existed are upgraded in place."""
+        have = {r["name"] for r in self.db.execute("PRAGMA table_info(facts)")}
+        for col, ddl in (("kind", "TEXT NOT NULL DEFAULT 'fact'"), ("importance", "INTEGER NOT NULL DEFAULT 1"),
+                         ("uses", "INTEGER NOT NULL DEFAULT 0"), ("last_used", "REAL NOT NULL DEFAULT 0")):
+            if col not in have:
+                self.db.execute(f"ALTER TABLE facts ADD COLUMN {col} {ddl}")
+
     # ---- facts ----
-    def remember(self, key: str, text: str, tags: str = "") -> Fact:
+    def remember(self, key: str, text: str, tags: str = "", kind: str = "fact", importance: int = 1) -> Fact:
         key = key.strip().lower()
+        kind = kind if kind in ("fact", "preference", "context") else "fact"
+        importance = min(3, max(1, int(importance)))
         now = time.time()
         cur = self.db.execute("SELECT id FROM facts WHERE key=?", (key,))
         row = cur.fetchone()
         if row:
-            self.db.execute("UPDATE facts SET text=?, tags=?, created_at=? WHERE id=?", (text, tags, now, row["id"]))
+            self.db.execute("UPDATE facts SET text=?, tags=?, created_at=?, kind=?, importance=? WHERE id=?",
+                            (text, tags, now, kind, importance, row["id"]))
         else:
-            self.db.execute("INSERT INTO facts(key,text,tags,created_at) VALUES (?,?,?,?)", (key, text, tags, now))
+            self.db.execute("INSERT INTO facts(key,text,tags,created_at,kind,importance) VALUES (?,?,?,?,?,?)",
+                            (key, text, tags, now, kind, importance))
         self.db.commit()
         return self.get_fact(key)  # type: ignore[return-value]
 
@@ -86,6 +116,98 @@ class Memory:
             "SELECT f.* FROM facts_fts JOIN facts f ON f.id=facts_fts.rowid "
             "WHERE facts_fts MATCH ? ORDER BY bm25(facts_fts) LIMIT ?", (q, limit)).fetchall()
         return [Fact(**dict(r)) for r in rows]
+
+    # ---- task history: what the user asked before and how it went ----
+    def record_task(self, request: str, outcome: str, tools: list[str], ok: bool = True) -> None:
+        self.db.execute("INSERT INTO task_history(request,outcome,tools,ok,created_at) VALUES (?,?,?,?,?)",
+                        (request[:300], outcome[:300], " ".join(dict.fromkeys(tools)), int(ok), time.time()))
+        self.db.execute("DELETE FROM task_history WHERE id <= (SELECT MAX(id) FROM task_history) - 500")   # bounded
+        self.db.commit()
+
+    def recent_tasks(self, limit: int = 10) -> list[dict]:
+        return [dict(r) for r in self.db.execute("SELECT * FROM task_history ORDER BY id DESC LIMIT ?", (limit,))]
+
+    def retrieve(self, query: str, limit: int = 5, max_chars: int = 900) -> list[dict]:
+        """Only what is relevant to `query`: ranked facts and past tasks, within a character budget.
+
+        Score = text relevance (bm25 rank) + importance + a little recency and past usefulness. Typos fall back to
+        fuzzy matching on keys/tags. Returns [{'source': 'fact'|'task', 'key', 'text', 'score'}]."""
+        q = _fts_query(query)
+        cands: dict[tuple[str, str], dict] = {}
+        now = time.time()
+        if q:
+            rows = self.db.execute(
+                "SELECT f.*, bm25(facts_fts) AS r FROM facts_fts JOIN facts f ON f.id=facts_fts.rowid "
+                "WHERE facts_fts MATCH ? ORDER BY r LIMIT ?", (q, limit * 3)).fetchall()
+            for n, r in enumerate(rows):
+                age_days = (now - r["created_at"]) / 86400
+                score = 10 - n * 0.7 + r["importance"] * 1.5 + min(r["uses"], 5) * 0.2 + (0.5 if age_days < 7 else 0)
+                cands[("fact", r["key"])] = {"source": "fact", "key": r["key"], "text": r["text"], "score": score, "id": r["id"]}
+            rows = self.db.execute(
+                "SELECT t.*, bm25(task_fts) AS r FROM task_fts JOIN task_history t ON t.id=task_fts.rowid "
+                "WHERE task_fts MATCH ? AND t.ok=1 ORDER BY r LIMIT ?", (q, 3)).fetchall()
+            for n, r in enumerate(rows):
+                cands[("task", str(r["id"]))] = {"source": "task", "key": str(r["id"]), "score": 5 - n,
+                                                 "text": f"Earlier you asked: {r['request']} -> {r['outcome']}"[:240]}
+        if not any(c["source"] == "fact" for c in cands.values()):
+            from .fuzzy import best_match
+            words = [w for w in re.findall(r"[a-z0-9]+", query.lower()) if w not in _STOP and len(w) > 3]
+            labels = {}                         # one entry per key/tag word, so 'pritner' can match 'printer'
+            for f in self.all_facts():
+                for tok in re.findall(r"[a-z0-9]+", f"{f.key.replace('_', ' ')} {f.tags.replace(',', ' ')}".lower()):
+                    if len(tok) > 3:
+                        labels.setdefault(tok, f)
+            for w in words:
+                for m in best_match(w, list(labels), threshold=82, limit=2):
+                    f = labels[m.value]
+                    cands[("fact", f.key)] = {"source": "fact", "key": f.key, "text": f.text, "id": f.id,
+                                              "score": 4 + f.importance}
+        ranked = sorted(cands.values(), key=lambda c: -c["score"])
+        out, used = [], 0
+        for c in ranked[:limit]:
+            if used + len(c["text"]) > max_chars and out:
+                break
+            out.append(c)
+            used += len(c["text"])
+        for c in out:
+            if c["source"] == "fact":
+                self.db.execute("UPDATE facts SET uses=uses+1, last_used=? WHERE id=?", (now, c["id"]))
+        if out:
+            self.db.commit()
+        return out
+
+    # ---- schedules (persistent definitions; the scheduler rebuilds its jobs from these) ----
+    def add_schedule(self, name: str, kind: str, spec: dict, action: dict) -> int:
+        cur = self.db.execute("INSERT INTO schedules(name,kind,spec,action,created_at) VALUES (?,?,?,?,?)",
+                              (name, kind, json.dumps(spec), json.dumps(action), time.time()))
+        self.db.commit()
+        return cur.lastrowid or 0
+
+    @staticmethod
+    def _sched(r: sqlite3.Row) -> dict:
+        d = dict(r)
+        d["spec"], d["action"], d["enabled"] = json.loads(d["spec"]), json.loads(d["action"]), bool(d["enabled"])
+        return d
+
+    def list_schedules(self, only_enabled: bool = False) -> list[dict]:
+        sql = "SELECT * FROM schedules" + (" WHERE enabled=1" if only_enabled else "") + " ORDER BY id"
+        return [self._sched(r) for r in self.db.execute(sql)]
+
+    def get_schedule(self, sid: int) -> dict | None:
+        r = self.db.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
+        return self._sched(r) if r else None
+
+    def update_schedule(self, sid: int, **fields) -> None:
+        cols = [k for k in fields if k in {"enabled", "last_run", "runs", "last_result"}]
+        if cols:
+            self.db.execute(f"UPDATE schedules SET {', '.join(f'{c}=?' for c in cols)} WHERE id=?",
+                            (*[fields[c] for c in cols], sid))
+            self.db.commit()
+
+    def delete_schedule(self, sid: int) -> bool:
+        cur = self.db.execute("DELETE FROM schedules WHERE id=?", (sid,))
+        self.db.commit()
+        return cur.rowcount > 0
 
     def forget(self, key: str) -> bool:
         cur = self.db.execute("DELETE FROM facts WHERE key=?", (key.strip().lower(),))

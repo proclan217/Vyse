@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, get_args, get_origin
 
 RISKS = ("safe", "write", "risky")
+# Explicit permission levels. 'safe' runs without asking, 'confirmation' always asks the user, 'blocked' never runs.
+PERMISSIONS = ("safe", "confirmation", "blocked")
 
 
 @dataclass
@@ -26,6 +28,22 @@ class Tool:
     final: bool = False
     # Optional dynamic policy hook: (args) -> Decision | None. Can only make a tool stricter.
     assess: Callable[[dict[str, Any]], Any] | None = None
+    # Explicit permission level; None derives it from `risk` (risky -> confirmation, otherwise safe).
+    permission: str | None = None
+    # Destructive tools always ask the user, even in auto-approve mode.
+    destructive: bool = False
+    # Independent, side-effect-light tools may run concurrently with each other inside one model step.
+    parallel: bool = False
+    # Seconds a successful result may be reused (0 = never cached). Only for read-only tools.
+    cache_ttl: float = 0.0
+    # Names of cached tools whose results this tool makes stale (e.g. move -> find_files, list_dir).
+    invalidates: tuple[str, ...] = ()
+
+    @property
+    def effective_permission(self) -> str:
+        if self.permission:
+            return self.permission
+        return "confirmation" if self.risk == "risky" else "safe"
 
     def schema(self) -> dict[str, Any]:
         return {"type": "function", "function": {
@@ -33,7 +51,14 @@ class Tool:
 
 
 class ToolError(Exception):
-    """Raised by a tool for expected failures; surfaced to the model as a structured error."""
+    """Raised by a tool for expected failures; surfaced to the model as a structured error.
+
+    `suggestions` ("did you mean" candidates) and `hint` travel with the error so the model can correct itself."""
+
+    def __init__(self, message: str = "", *, suggestions: list[str] | None = None, hint: str = "") -> None:
+        super().__init__(message)
+        self.suggestions = list(suggestions or [])
+        self.hint = hint
 
 
 def _json_type(tp: Any) -> dict[str, Any]:
@@ -101,18 +126,28 @@ class Registry:
     def add(self, fn: Callable[..., Any], *, risk: str, name: str | None = None,
             description: str | None = None, keywords: tuple[str, ...] = (),
             group: str = "general", always: bool = False, final: bool = False,
-            parameters: dict[str, Any] | None = None, assess: Callable | None = None) -> Tool:
+            parameters: dict[str, Any] | None = None, assess: Callable | None = None,
+            permission: str | None = None, destructive: bool = False, parallel: bool | None = None,
+            cache_ttl: float = 0.0, invalidates: tuple[str, ...] = ()) -> Tool:
         summary, params = build_schema(fn) if parameters is None else ("", parameters)
+        if permission is not None and permission not in PERMISSIONS:
+            raise ValueError(f"invalid permission {permission!r} for {name or fn.__name__}")
         return self.register(Tool(
             name=name or fn.__name__, description=description or summary or (name or fn.__name__),
             risk=risk, fn=fn, parameters=params, keywords=keywords, group=group, always=always,
-            final=final, assess=assess))
+            final=final, assess=assess, permission=permission, destructive=destructive,
+            parallel=(risk == "safe" and not destructive) if parallel is None else parallel,
+            cache_ttl=cache_ttl, invalidates=invalidates))
 
     def tool(self, *, risk: str = "safe", name: str | None = None, keywords: tuple[str, ...] = (),
-             group: str = "general", always: bool = False, final: bool = False, assess: Callable | None = None):
-        """Decorator bound to this registry (used by tool modules so tests can use private registries)."""
+             group: str = "general", always: bool = False, final: bool = False, assess: Callable | None = None,
+             **opts: Any):
+        """Decorator bound to this registry (used by tool modules so tests can use private registries).
+
+        `opts`: permission, destructive, parallel, cache_ttl, invalidates (see Tool)."""
         def deco(fn):
-            self.add(fn, risk=risk, name=name, keywords=keywords, group=group, always=always, final=final, assess=assess)
+            self.add(fn, risk=risk, name=name, keywords=keywords, group=group, always=always, final=final,
+                     assess=assess, **opts)
             return fn
         return deco
 
@@ -166,8 +201,12 @@ class Registry:
             for x in self._tools.values():
                 if x.group == top.group:
                     add(x)
-            for _, t in scored:
-                add(t)
+            # Two words of the request spell out the tool's own name ('save a routine' -> save_routine):
+            # the intent is unambiguous, so don't also offer unrelated 'doing' tools the model might grab instead.
+            name_hits = len(set(re.findall(r'[a-z0-9]+', query.lower())) & set(top.name.split('_')))
+            if name_hits < 2:
+                for _, t in scored:
+                    add(t)
         if not picked:      # typo or unfamiliar wording: offer a small core set rather than nothing
             core = [self._tools[n] for n in CORE_TOOLS if n in self._tools]
             picked = [t for t in core if t not in chosen] or list(self._tools.values())
@@ -182,9 +221,9 @@ REGISTRY = Registry()
 
 
 def tool(*, risk: str = "safe", name: str | None = None, keywords: tuple[str, ...] = (),
-         group: str = "general", always: bool = False, registry: Registry | None = None):
+         group: str = "general", always: bool = False, registry: Registry | None = None, **opts: Any):
     """Register a function as an agent tool. Schema comes from type hints + docstring."""
     def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
-        (registry or REGISTRY).add(fn, risk=risk, name=name, keywords=keywords, group=group, always=always)
+        (registry or REGISTRY).add(fn, risk=risk, name=name, keywords=keywords, group=group, always=always, **opts)
         return fn
     return deco

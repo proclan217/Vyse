@@ -80,5 +80,5 @@ def test_real_registry_exposes_documented_params(registry):
         assert t.description, t.name
         assert t.risk in ("safe", "write", "risky")
     plan = registry.get("plan_organize").parameters
-    assert plan["properties"]["strategy"]["enum"] == ["by_type", "by_date", "by_name"]
+    assert plan["properties"]["strategy"]["enum"] == ["by_rules", "by_type", "by_date", "by_name"]
     assert registry.get("run_command").risk == "risky"

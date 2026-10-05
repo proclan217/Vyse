@@ -118,3 +118,13 @@ Vyse is a receptionist, so it is tuned for speed with `qwen3:4b-instruct-2507` (
     setx NVIDIA_API_KEY "nvapi-..."      # then open a new terminal
 
 Set `provider = "ollama"` to go back to local models. Note: with a hosted provider your prompts and tool results leave the PC.
+
+
+## Teaching Vyse (memory & routines)
+
+Nothing here is hard-coded: Vyse stores what you tell it and the model decides how to use it.
+
+- **Favorites** - "my favorite show is Severance, here's the Netflix link ..." / "my lofi playlist is <Spotify link>". Stored as facts (SQLite + FTS5) together with how to open them, and recalled automatically when a request matches.
+- **Routines** - "save a routine called study session: open Clock, 25 minute timer, my lofi playlist, my favorite show, close Valorant and Roblox Player". The model turns this into a list of tool calls (`save_routine`); "start my study session" runs them (`run_routine`). Every step still goes through normal validation, safety policy and confirmations. Steps are checked when saved, so wrong argument names are rejected immediately.
+- **Clarifying questions** - if "open spotify" could mean the app or a remembered playlist, Vyse asks (`ask_user`) instead of guessing.
+- New tools used by routines: `close_app` (graceful close, never a force kill) and `set_timer` (beep + popup). Manage with `/memory`, "list my routines", "delete the study session routine".

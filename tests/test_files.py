@@ -94,7 +94,7 @@ def test_move_into_protected_is_blocked_even_with_auto_yes(ctx, registry, home):
 def test_trash_never_hard_deletes_and_undo_restores(ctx, registry, home, cfg):
     f = home / "Downloads" / "gone.txt"
     f.write_text("keep me")
-    a = agent_for(ctx, registry)
+    a = agent_for(ctx, registry, confirm=lambda p, r: True)   # trash always asks
     r = run(a, "trash", path=str(f))
     assert r["ok"] and r["verified"] and not f.exists()
     assert os.path.exists(r["trashed_to"]) and open(r["trashed_to"]).read() == "keep me"

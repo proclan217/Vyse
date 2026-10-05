@@ -10,6 +10,7 @@ from typing import Any, Callable, Iterator
 import httpx
 
 from .config import ModelConfig
+from .repair import parse_arguments
 
 
 @dataclass
@@ -17,6 +18,7 @@ class ToolCall:
     name: str
     arguments: dict[str, Any] = field(default_factory=dict)
     error: str | None = None  # set when the model produced a malformed call
+    repairs: list[str] = field(default_factory=list)  # fixes applied to the raw call (JSON repair etc.)
 
 
 @dataclass
@@ -24,6 +26,8 @@ class LLMResponse:
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     thinking: str = ""
+    prompt_tokens: int = 0       # reported by the backend (0 = not reported; the agent then estimates)
+    completion_tokens: int = 0
 
 
 class LLMError(Exception):
@@ -51,17 +55,11 @@ def parse_tool_calls(raw_calls: list[dict[str, Any]]) -> list[ToolCall]:
         if not isinstance(fn, dict) or not fn.get("name"):
             out.append(ToolCall(name="", error="Malformed tool call: missing function name."))
             continue
-        args = fn.get("arguments", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args) if args.strip() else {}
-            except json.JSONDecodeError as e:
-                out.append(ToolCall(name=fn["name"], error=f"Arguments were not valid JSON ({e}). Send a JSON object."))
-                continue
-        if not isinstance(args, dict):
-            out.append(ToolCall(name=fn["name"], error="Arguments must be a JSON object."))
+        args, repairs, err = parse_arguments(fn.get("arguments", {}))
+        if args is None:
+            out.append(ToolCall(name=fn["name"], error=err or "Arguments must be a JSON object."))
             continue
-        out.append(ToolCall(name=fn["name"], arguments=args))
+        out.append(ToolCall(name=fn["name"], arguments=args, repairs=repairs))
     return out
 
 
@@ -102,6 +100,9 @@ class OllamaClient(LLMClient):
                         if on_token:
                             on_token(msg["content"])
                     raw_calls.extend(msg.get("tool_calls") or [])
+                    if chunk.get("done"):
+                        resp.prompt_tokens = int(chunk.get("prompt_eval_count") or 0)
+                        resp.completion_tokens = int(chunk.get("eval_count") or 0)
         except httpx.ConnectError as e:
             raise LLMError(f"Cannot reach Ollama at {self.cfg.ollama_url}. Is it running? ({e})") from e
         except httpx.HTTPError as e:
@@ -188,6 +189,7 @@ class OpenAIClient(LLMClient):
             "max_tokens": self.cfg.num_predict,
             "messages": [_to_openai(m) for m in messages],
             "chat_template_kwargs": {"enable_thinking": bool(self.cfg.think)},
+            "stream_options": {"include_usage": True},
         }
         if tools:
             payload["tools"] = tools
@@ -214,7 +216,12 @@ class OpenAIClient(LLMClient):
                         data = line[5:].strip()
                         if data == "[DONE]":
                             break
-                        for ch in json.loads(data).get("choices") or []:
+                        obj = json.loads(data)
+                        usage = obj.get("usage") or {}
+                        if usage:
+                            resp.prompt_tokens = int(usage.get("prompt_tokens") or 0)
+                            resp.completion_tokens = int(usage.get("completion_tokens") or 0)
+                        for ch in obj.get("choices") or []:
                             d = ch.get("delta") or {}
                             if d.get("content"):
                                 resp.content += d["content"]

@@ -30,6 +30,7 @@ class Entry:
     dst: str
     ts: float
     undone: bool = False
+    label: str = ""      # what caused it (tool name), shown in the history
 
 
 class Journal:
@@ -46,7 +47,8 @@ class Journal:
         out = []
         for line in self.path.read_text(encoding="utf-8").splitlines():
             if line.strip():
-                out.append(Entry(**json.loads(line)))
+                d = json.loads(line)
+                out.append(Entry(**{k: v for k, v in d.items() if k in Entry.__dataclass_fields__}))
         return out
 
     def _save(self, entries: list[Entry]) -> None:
@@ -55,8 +57,10 @@ class Journal:
     def new_batch(self) -> str:
         return uuid.uuid4().hex[:8]
 
+    label: str = ""      # set by the agent for the duration of a tool call so every entry says what did it
+
     def _append(self, batch: str, op: str, src: Path, dst: Path) -> Entry:
-        e = Entry(uuid.uuid4().hex[:8], batch, op, str(src), str(dst), time.time())
+        e = Entry(uuid.uuid4().hex[:8], batch, op, str(src), str(dst), time.time(), label=self.label)
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(e.__dict__) + "\n")
         return e
@@ -109,7 +113,24 @@ class Journal:
         self._append(batch, "trash", src, dst)
         return dst
 
-    # ---- undo ----
+    # ---- transaction log / undo ----
+    def history(self, limit: int = 10, include_undone: bool = True) -> list[dict]:
+        """Recent transactions (one per batch), newest first: what was done and whether it can still be undone."""
+        batches: dict[str, dict] = {}
+        for e in self._load():
+            b = batches.setdefault(e.batch, {"batch": e.batch, "label": e.label, "ts": e.ts, "ops": [], "undone": True})
+            b["ops"].append({"op": e.op, "src": e.src, "dst": e.dst, "undone": e.undone})
+            b["undone"] = b["undone"] and e.undone
+            b["label"] = b["label"] or e.label
+        rows = sorted(batches.values(), key=lambda b: -b["ts"])
+        if not include_undone:
+            rows = [r for r in rows if not r["undone"]]
+        for r in rows:
+            moves = [o for o in r["ops"] if o["op"] != "mkdir"]
+            r["summary"] = describe_ops(r["ops"])
+            r["files"] = len(moves)
+        return rows[:limit]
+
     def last_batch(self) -> str | None:
         for e in reversed(self._load()):
             if not e.undone:
@@ -118,12 +139,32 @@ class Journal:
 
     def undo_last(self) -> tuple[list[str], list[str]]:
         """Reverse the most recent batch. Returns (reverted descriptions, problems)."""
+        return self.undo(steps=1)
+
+    def undo(self, steps: int = 1, batch: str | None = None) -> tuple[list[str], list[str]]:
+        """Reverse the last `steps` batches, or one specific batch by id. Returns (reverted, problems)."""
         entries = self._load()
-        batch = next((e.batch for e in reversed(entries) if not e.undone), None)
-        if batch is None:
+        if batch:
+            targets = [batch] if any(e.batch == batch and not e.undone for e in entries) else []
+            if not targets:
+                known = any(e.batch == batch for e in entries)
+                return [], [f"Transaction {batch} was already undone." if known else f"No transaction with id {batch}."]
+        else:
+            order: list[str] = []
+            for e in reversed(entries):
+                if not e.undone and e.batch not in order:
+                    order.append(e.batch)
+            targets = order[:max(1, steps)]
+        if not targets:
             return [], ["Nothing to undo."]
         done: list[str] = []
         problems: list[str] = []
+        for b in targets:
+            self._undo_batch(entries, b, done, problems)
+        self._save(entries)
+        return done, problems
+
+    def _undo_batch(self, entries: list[Entry], batch: str, done: list[str], problems: list[str]) -> None:
         for e in reversed([x for x in entries if x.batch == batch and not x.undone]):
             src, dst = Path(e.src), Path(e.dst)
             try:
@@ -150,5 +191,16 @@ class Journal:
             except Exception as ex:  # keep going; report
                 problems.append(f"{e.op} {e.src}: {ex}")
                 e.undone = True  # don't retry forever
-        self._save(entries)
-        return done, problems
+
+
+def describe_ops(ops: list[dict]) -> str:
+    """'moved 12 files', 'trashed report.pdf', 'copied 2 files' for a transaction's operations."""
+    real = [o for o in ops if o["op"] != "mkdir"]
+    if not real:
+        return f"created {len(ops)} folder(s)"
+    verbs = {"move": "moved", "trash": "trashed", "copy": "copied"}
+    first = real[0]["op"]
+    verb = verbs.get(first, first)
+    if len(real) == 1:
+        return f"{verb} {Path(real[0]['src']).name}"
+    return f"{verb} {len(real)} items"

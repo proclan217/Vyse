@@ -35,6 +35,34 @@ class AgentConfig:
     summarize_after: int = 20
     relevant_facts: int = 5
     max_tools_per_turn: int = 14
+    parallel_tools: bool = True       # run independent tools of one model step concurrently
+    max_parallel: int = 4
+    max_calls_per_step: int = 6       # a model step may chain/batch at most this many calls
+    context_tokens: int = 2200        # soft budget for the prompt (history + tool results); older parts get trimmed
+    tool_result_chars: int = 1800     # cap per tool result sent back to the model
+    tool_timeout: float = 60.0        # seconds before a parallel tool call is reported as timed out
+    relevant_memories: int = 5
+
+
+@dataclass
+class IndexConfig:
+    enabled: bool = True
+    roots: list[str] = field(default_factory=lambda: ["~/Desktop", "~/Documents", "~/Downloads"])
+    max_files: int = 400_000
+    stale_minutes: float = 30.0       # a search triggers a background refresh when the index is older than this
+
+
+@dataclass
+class OrganizeRule:
+    """One deterministic sorting rule: files that match go to `dest` (relative to the folder being organized)."""
+    name: str
+    dest: str
+    ext: list[str] = field(default_factory=list)
+    name_contains: list[str] = field(default_factory=list)
+    name_regex: str = ""
+    min_size_mb: float = 0.0
+    max_size_mb: float = 0.0
+    older_than_days: float = 0.0
 
 
 @dataclass
@@ -69,6 +97,17 @@ class Config:
     apps: dict[str, AppEntry] = field(default_factory=dict)
     mcp_servers: list[McpServer] = field(default_factory=list)
     google_enabled: bool = True
+    # --- feature settings ---
+    index: IndexConfig = field(default_factory=IndexConfig)
+    organize_rules: list[OrganizeRule] = field(default_factory=list)
+    permissions: dict[str, str] = field(default_factory=dict)   # tool name -> safe | confirmation | blocked (stricter only)
+    app_scan: bool = True              # detect installed apps (Start Menu, App Paths, UWP) for fuzzy launching
+    app_scan_ttl_hours: float = 12.0
+    cache_enabled: bool = True
+    cache_max_entries: int = 256
+    scheduler_enabled: bool = True
+    metrics_enabled: bool = True
+    metrics_retention_days: int = 30
 
     @property
     def db_path(self) -> Path:
@@ -133,4 +172,15 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
             name=s["name"], command=s["command"], args=s.get("args", []),
             trusted_tools=s.get("trusted_tools", [])))
     cfg.google_enabled = raw.get("google", {}).get("enabled", True)
+    ix = raw.get("index", {})
+    cfg.index = IndexConfig(**{k: v for k, v in ix.items() if k in IndexConfig.__dataclass_fields__})
+    for r in raw.get("organize", {}).get("rules", []):
+        cfg.organize_rules.append(OrganizeRule(**{k: v for k, v in r.items() if k in OrganizeRule.__dataclass_fields__}))
+    perms = raw.get("permissions", {})
+    cfg.permissions = {str(k): str(v) for k, v in perms.items() if str(v) in ("safe", "confirmation", "blocked")}
+    feat = raw.get("features", {})
+    for key in ("app_scan", "app_scan_ttl_hours", "cache_enabled", "cache_max_entries", "scheduler_enabled",
+                "metrics_enabled", "metrics_retention_days"):
+        if key in feat:
+            setattr(cfg, key, feat[key])
     return cfg

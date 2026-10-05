@@ -19,11 +19,16 @@ class Decision:
     action: str = ALLOW
     reason: str = ""
     preview: str = ""
+    destructive: bool = False       # destructive confirmations are never skipped by auto-approve
 
     def stricter(self, other: "Decision | None") -> "Decision":
         if other is None:
             return self
-        return other if _ORDER[other.action] > _ORDER[self.action] else self
+        if _ORDER[other.action] > _ORDER[self.action]:
+            other.destructive = other.destructive or self.destructive
+            return other
+        self.destructive = self.destructive or other.destructive
+        return self
 
 
 def _norm(p: str | Path) -> Path:
@@ -125,10 +130,26 @@ class Policy:
         return Decision(CONFIRM, reason, preview=f"Run command:\n  {command}")
 
     # ---- tools ----
+    def permission_of(self, tool: Tool) -> str:
+        """The tool's permission level after config overrides (config may only tighten, never relax)."""
+        rank = {"safe": 0, "confirmation": 1, "blocked": 2}
+        level = tool.effective_permission
+        override = self.cfg.permissions.get(tool.name)
+        if override and rank[override] > rank[level]:
+            level = override
+        if tool.destructive and level == "safe":
+            level = "confirmation"
+        return level
+
     def decide(self, tool: Tool, args: dict[str, Any]) -> Decision:
-        if tool.risk == "risky":
-            base = Decision(CONFIRM if self.cfg.confirm_risky else ALLOW,
-                            f"'{tool.name}' is a risky action.")
+        level = self.permission_of(tool)
+        if level == "blocked":
+            return Decision(BLOCK, f"'{tool.name}' is disabled (permission: blocked).")
+        if level == "confirmation":
+            ask = self.cfg.confirm_risky or tool.risk != "risky" or tool.destructive
+            base = Decision(CONFIRM if ask else ALLOW,
+                            f"'{tool.name}' is a destructive action." if tool.destructive else f"'{tool.name}' needs your approval.",
+                            destructive=tool.destructive)
         else:
             base = Decision(ALLOW)
         if tool.assess is not None:

@@ -9,15 +9,17 @@ def register(reg: Registry, ctx: Context) -> None:
     mem = ctx.memory
 
     @reg.tool(risk="safe", group="memory", keywords=("remember", "memorize", "save", "store", "my", "fact", "note"))
-    def remember(key: str, text: str, tags: str = "") -> dict:
-        """Store a lasting fact about the user or their setup, including favorites and how to open them. Reusing a key updates that fact.
+    def remember(key: str, text: str, tags: str = "", kind: str = "fact", importance: int = 1) -> dict:
+        """Store a lasting fact about the user or their setup, including favorites and how to open them. Only when the user states or asks you to remember something; never infer or invent facts. Reusing a key updates that fact.
 
         Args:
             key: Short unique label, e.g. 'printer' or 'favorite_editor'.
             text: The full fact as a sentence. For favorites include how to open it, e.g. 'Favorite show: Severance, open with open_path https://www.netflix.com/title/81152350' or 'Favorite lofi playlist on Spotify: open_path https://open.spotify.com/playlist/xyz'.
             tags: Optional comma-separated tags.
+            kind: 'fact', 'preference' (how the user likes things done) or 'context' (ongoing situation).
+            importance: 1 (normal) to 3 (very important); important memories are retrieved first.
         """
-        f = mem.remember(key, text, tags)
+        f = mem.remember(key, text, tags, kind, importance)
         return {"key": f.key, "verified": mem.get_fact(f.key) is not None, "display": f"Remembered: {f.text}"}
 
     @reg.tool(risk="safe", group="memory", keywords=("recall", "remember", "what", "my", "do", "know", "memory", "forgot"))
@@ -29,6 +31,9 @@ def register(reg: Registry, ctx: Context) -> None:
             limit: Maximum facts to return.
         """
         facts = mem.recall(query, limit)
+        if not facts:   # typo-tolerant, relevance-ranked fallback (facts and past tasks)
+            hits = mem.retrieve(query, limit)
+            return {"facts": [{"key": h["key"], "text": h["text"]} for h in hits], "display": f"{len(hits)} memory item(s) recalled"}
         return {"facts": [{"key": f.key, "text": f.text} for f in facts], "display": f"{len(facts)} fact(s) recalled"}
 
     @reg.tool(risk="write", group="memory", keywords=("forget", "remove", "erase", "memory", "fact"))

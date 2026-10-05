@@ -18,7 +18,8 @@ import psutil
 
 from ..config import AppEntry, Config, expand
 from ..context import Context
-from ..policy import ALLOW, CONFIRM, Decision
+from ..fuzzy import fuzzy_path, path_hint, resolve as fuzzy_resolve, suggestions
+from ..policy import ALLOW, BLOCK, CONFIRM, Decision
 from .files import resolve_path
 from .registry import Registry, ToolError
 
@@ -123,15 +124,30 @@ def register(reg: Registry, ctx: Context) -> None:
 
     @reg.tool(risk="safe", group="apps", final=True, keywords=("open", "launch", "start", "app", "application", "game", "program", *app_words))
     def open_app(name: str) -> dict:
-        """Open an installed application by name (e.g. 'Discord', 'Medal', 'Valorant'). Apps come from Vyse's app registry, then the Start Menu. Verifies that the app actually started. Only for desktop applications; for websites (Netflix, YouTube, Gmail...) or a new browser tab use open_path with the site's https URL instead.
+        """Open an installed application by name (e.g. 'Discord', 'Medal', 'Valorant'). Vyse detects installed apps itself and fuzzy-matches the name (typos and partial names are fine). Verifies that the app actually started. Only for desktop applications; for websites (Netflix, YouTube, Gmail...) or a new browser tab use open_path with the site's https URL instead.
 
         Args:
             name: The application name.
         """
         entry = find_app(name, cfg.apps)
-        process = entry.process if entry else None
+        rec = None                                  # an installed app found by the catalog (fuzzy), when no configured app matched
+        matched_as = ""
+        if entry is None and ctx.apps is not None and ctx.apps.enabled:
+            res = ctx.apps.resolve(name)
+            if res.status == "ambiguous":
+                names = [str(m.value) for m in res.candidates][:4]
+                raise ToolError(f"'{name}' could mean several apps: {', '.join(names)}.", suggestions=names,
+                                hint="Ask the user which one they mean (ask_user), then call open_app with the exact name.")
+            if res.ok and res.match is not None:
+                rec = res.match.key
+                if rec.kind == "config":            # the catalog echoes configured apps; use the real entry
+                    entry = next((e for e in cfg.apps.values() if e.name == rec.name), None)
+                    rec = None
+                if res.status == "fuzzy" or res.match.value.lower() != name.strip().lower():
+                    matched_as = rec.name if rec else (entry.name if entry else "")
+        process = entry.process if entry else (rec.process if rec else None)
         tokens = [process] if process else []
-        label = entry.name.capitalize() if entry else name.strip()
+        label = entry.name.capitalize() if entry else (rec.name if rec else name.strip())
         before = running_process_names()
         if process and process.lower() in before:
             return {"app": label, "already_running": True, "verified": True, "display": f"{label} is already running"}
@@ -145,18 +161,33 @@ def register(reg: Registry, ctx: Context) -> None:
                 target, args, via = exe, entry.args, "registry"
             elif shutil.which(entry.path):
                 target, args, via = Path(shutil.which(entry.path)), entry.args, "PATH"  # type: ignore[arg-type]
-        if target is None:
+        uwp_id = ""
+        if target is None and rec is not None:
+            if rec.kind == "uwp":
+                uwp_id, via = rec.target, "Start apps"
+            elif rec.target and Path(rec.target).exists():
+                target, via = Path(rec.target), "Start Menu" if rec.kind == "lnk" else "App Paths"
+                if rec.kind == "apppath":
+                    tokens.append(Path(rec.target).name)
+        if target is None and not uwp_id:
             lnk = find_start_menu(entry.name if entry else name) or (find_start_menu(name) if entry else None)
             if lnk:
                 target, via = lnk, "Start Menu"
-        if target is None and shutil.which(name):
+        if target is None and not uwp_id and shutil.which(name):
             target, via = Path(shutil.which(name)), "PATH"  # type: ignore[arg-type]
-        if target is None:
+        if target is None and not uwp_id:
+            near = ctx.apps.suggest(name) if ctx.apps is not None and ctx.apps.enabled else []
+            near = near or suggestions(name, [a.name for a in cfg.apps.values()], limit=3, threshold=55)
             known = ", ".join(sorted(cfg.apps)) or "none"
-            raise ToolError(f"I couldn't find an app called '{name}'. Known apps: {known}. Add it under [apps.*] in config.toml.")
+            raise ToolError(f"I couldn't find an app called '{name}'." + (f" Did you mean: {', '.join(near)}?" if near else "")
+                            + f" Known apps: {known}. Add it under [apps.*] in config.toml.", suggestions=near,
+                            hint="Try one of the suggestions, or ask the user for the exact app name.")
 
         try:
-            if target.suffix.lower() == ".lnk":
+            if uwp_id:
+                subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{uwp_id}"], creationflags=DETACHED,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+            elif target is not None and target.suffix.lower() == ".lnk":
                 os.startfile(str(target))  # type: ignore[attr-defined]
             else:
                 subprocess.Popen([str(target), *args], cwd=str(target.parent), creationflags=DETACHED,
@@ -165,8 +196,12 @@ def register(reg: Registry, ctx: Context) -> None:
             raise ToolError(f"Failed to start {label}: {e}")
         seen = wait_for_process(tokens + [re.sub(r"[^a-z0-9]", "", name.lower())], timeout=4)
         ok = seen is not None
-        return {"app": label, "launched_via": via, "verified": ok,
-                "display": f"{label}" + (" started" if ok else " launch requested but process not detected yet")}
+        out = {"app": label, "launched_via": via, "verified": ok,
+               "display": f"{label}" + (" started" if ok else " launch requested but process not detected yet")}
+        if matched_as and matched_as.lower() != name.strip().lower():
+            out["matched_as"] = matched_as
+            out["display"] += f" (matched '{name.strip()}' to '{matched_as}')"
+        return out
 
     @reg.tool(risk="write", group="apps", final=True, keywords=("close", "quit", "exit", "stop", "kill", "shut", "end", "app", "game", "games"))
     def close_app(name: str) -> dict:
@@ -182,13 +217,72 @@ def register(reg: Registry, ctx: Context) -> None:
         if not process.lower().endswith(".exe"):
             process += ".exe"
         if process.lower() not in running_process_names():
-            return {"app": name, "verified": True, "display": f"{name.strip()} is not running"}
+            running = sorted({n for n in running_process_names() if n.endswith(".exe")})
+            near = suggestions(process.removesuffix(".exe"), [n.removesuffix(".exe") for n in running], limit=3, threshold=70)
+            res = {"app": name, "verified": True, "display": f"{name.strip()} is not running"}
+            if near:
+                res["suggestions"] = near
+                res["display"] += f" (did you mean: {', '.join(near)}?)"
+            return res
         subprocess.run(["taskkill", "/IM", process], capture_output=True, text=True, timeout=15)   # no /F: graceful close
         for _ in range(8):
             if process.lower() not in running_process_names():
                 return {"app": name, "verified": True, "display": f"Closed {name.strip()}"}
             time.sleep(0.5)
         return {"app": name, "verified": False, "display": f"Asked {name.strip()} to close, but it is still running (it may be asking to save)"}
+
+    PROTECTED_PROCESSES = {"system", "system idle process", "registry", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
+                           "services.exe", "lsass.exe", "svchost.exe", "dwm.exe", "explorer.exe", "fontdrvhost.exe", "memcompression"}
+
+    def _find_procs(name: str, pid: int) -> list[psutil.Process]:
+        out: list[psutil.Process] = []
+        want = name.strip().lower()
+        want_exe = want if want.endswith(".exe") else want + ".exe"
+        for p in psutil.process_iter(["name", "pid"]):
+            n = (p.info.get("name") or "").lower()
+            if (pid and p.info["pid"] == pid) or (want and n in (want, want_exe)):
+                out.append(p)
+        return out
+
+    def _kill_assess(args: dict[str, Any]) -> Decision:
+        name, pid = str(args.get("name", "")), int(args.get("pid") or 0)
+        procs = _find_procs(name, pid)
+        own = {os.getpid(), *(p.pid for p in psutil.Process(os.getpid()).parents())}
+        for p in procs:
+            pn = (p.info.get("name") or "").lower()
+            if pn in PROTECTED_PROCESSES or p.pid in own or p.pid <= 4:
+                return Decision(BLOCK, f"'{p.info.get('name')}' is a critical system process (or Vyse itself) and cannot be killed.")
+        listing = ", ".join(f"{p.info.get('name')} (pid {p.pid})" for p in procs[:8]) or "nothing running with that name"
+        return Decision(CONFIRM, "Force-killing a process can lose unsaved work.", f"Force-kill: {listing}", destructive=True)
+
+    @reg.tool(risk="write", group="system", destructive=True, final=True, assess=_kill_assess, invalidates=("get_running_apps", "get_cpu_usage", "get_ram_usage"),
+              keywords=("kill", "terminate", "force", "end", "stop", "process", "task", "frozen", "hung", "stuck", "crash"))
+    def kill_process(name: str = "", pid: int = 0) -> dict:
+        """Force-kill a process by exact name (e.g. 'notepad.exe') or pid. DESTRUCTIVE: always asks the user first and can lose unsaved work. For a normal close use close_app instead.
+
+        Args:
+            name: Exact process name, e.g. 'notepad.exe'. Leave empty when giving a pid.
+            pid: Process id (alternative to name).
+        """
+        if not name.strip() and not pid:
+            raise ToolError("Give a process name or a pid.")
+        procs = _find_procs(name, pid)
+        if not procs:
+            running = sorted({(p.info.get("name") or "") for p in psutil.process_iter(["name"])})
+            near = suggestions(name.strip(), running, limit=3, threshold=60) if name.strip() else []
+            raise ToolError(f"No running process '{name or pid}'." + (f" Did you mean: {', '.join(near)}?" if near else ""),
+                            suggestions=near, hint="Kill only exact process names; check get_running_apps.")
+        killed, failed = [], []
+        for p in procs:
+            try:
+                p.kill()
+                killed.append(f"{p.info.get('name')}({p.pid})")
+            except psutil.Error as e:
+                failed.append(f"{p.info.get('name')}({p.pid}): {e}")
+        _, alive = psutil.wait_procs(procs, timeout=3)
+        ok = not alive and not failed
+        return {"killed": killed, "failed": failed, "verified": ok,
+                "display": f"Killed {', '.join(killed) or 'nothing'}" + (f"; failed: {'; '.join(failed)}" if failed else "")}
 
     @reg.tool(risk="safe", group="system", final=True, keywords=("timer", "countdown", "alarm", "remind", "minutes", "pomodoro"))
     def set_timer(minutes: float, label: str = "Timer") -> dict:
@@ -217,7 +311,7 @@ def register(reg: Registry, ctx: Context) -> None:
         t.start()
         return {"verified": True, "display": f"{label} set for {minutes:g} min"}
 
-    @reg.tool(risk="safe", group="apps", final=True, keywords=("running", "apps", "open", "windows", "processes", "what", "currently"))
+    @reg.tool(risk="safe", cache_ttl=5, group="apps", final=True, keywords=("running", "apps", "open", "windows", "processes", "what", "currently"))
     def get_running_apps(max_items: int = 30) -> dict:
         """List applications that currently have a visible window.
 
@@ -249,15 +343,20 @@ def register(reg: Registry, ctx: Context) -> None:
             webbrowser.open(path.strip(), new=2)      # new tab
             return {"opened": path, "verified": None, "display": f"Opened {path}"}
         p = resolve_path(path)
+        was = ""
         if not p.exists():
-            raise ToolError(f"Not found: {p}")
+            fixed, alts = fuzzy_path(p)
+            if fixed is not None and _open_assess({"path": str(fixed)}).action == ALLOW:   # never auto-correct onto a program
+                p, was = fixed, str(p)
+            else:
+                raise ToolError(f"Not found: {p}.{path_hint(p)}", suggestions=[str(a) for a in ([fixed] if fixed else alts)][:3])
         os.startfile(str(p))  # type: ignore[attr-defined]
-        return {"opened": str(p), "verified": None, "display": f"Opened {p}"}
+        return {"opened": str(p), "verified": None, "display": f"Opened {p}", **({"corrected_from": was} if was else {})}
 
     def _open_assess(args: dict[str, Any]) -> Decision | None:
         raw = str(args.get("path", ""))
         if re.match(r"^https?://", raw.strip(), re.I):
-            return None
+            return Decision(ALLOW)
         p = resolve_path(raw)
         d = pol.check_path(p, write=False)
         if p.suffix.lower() in EXECUTABLE_SUFFIXES and d.action != "block":
@@ -265,7 +364,7 @@ def register(reg: Registry, ctx: Context) -> None:
         return d
 
     # ---------------------------------------------------------- system info
-    @reg.tool(risk="safe", group="system", final=True, keywords=("system", "info", "computer", "pc", "specs", "hardware", "windows", "os", "uptime"))
+    @reg.tool(risk="safe", cache_ttl=30, group="system", final=True, keywords=("system", "info", "computer", "pc", "specs", "hardware", "windows", "os", "uptime"))
     def system_info() -> dict:
         """Overall PC summary: OS, CPU, RAM, uptime."""
         vm = psutil.virtual_memory()
@@ -276,7 +375,7 @@ def register(reg: Registry, ctx: Context) -> None:
                 "ram_used_percent": vm.percent, "uptime": f"{up // 3600}h {up % 3600 // 60}m",
                 "display": f"{platform.system()} {platform.release()}, CPU {psutil.cpu_percent():.0f}%, RAM {vm.percent:.0f}%"}
 
-    @reg.tool(risk="safe", group="system", final=True, keywords=("cpu", "processor", "usage", "load", "performance", "slow"))
+    @reg.tool(risk="safe", cache_ttl=5, group="system", final=True, keywords=("cpu", "processor", "usage", "load", "performance", "slow"))
     def get_cpu_usage() -> dict:
         """Current CPU utilisation and the busiest processes."""
         procs = list(psutil.process_iter(["name"]))
@@ -298,7 +397,7 @@ def register(reg: Registry, ctx: Context) -> None:
         return {"cpu_percent": total, "top_processes": [{"name": n, "cpu_percent": round(c, 1)} for c, n in top],
                 "display": f"CPU at {total:.0f}%. Busiest: " + ", ".join(f"{n} {c:.0f}%" for c, n in top[:3])}
 
-    @reg.tool(risk="safe", group="system", final=True, keywords=("ram", "memory", "usage", "performance", "slow"))
+    @reg.tool(risk="safe", cache_ttl=5, group="system", final=True, keywords=("ram", "memory", "usage", "performance", "slow"))
     def get_ram_usage() -> dict:
         """Current RAM usage and the biggest memory consumers."""
         vm = psutil.virtual_memory()
@@ -309,7 +408,7 @@ def register(reg: Registry, ctx: Context) -> None:
                 "display": f"RAM {vm.percent:.0f}% used ({vm.used / 2**30:.1f}/{vm.total / 2**30:.1f} GB). Biggest: "
                            + ", ".join(f"{n} {b / 2**20:.0f} MB" for b, n in top[:3])}
 
-    @reg.tool(risk="safe", group="system", final=True, keywords=("gpu", "graphics", "video", "card", "usage", "nvidia", "amd", "performance"))
+    @reg.tool(risk="safe", cache_ttl=5, group="system", final=True, keywords=("gpu", "graphics", "video", "card", "usage", "nvidia", "amd", "performance"))
     def get_gpu_usage() -> dict:
         """Current GPU name and utilisation."""
         info: dict[str, Any] = {}
@@ -332,7 +431,7 @@ def register(reg: Registry, ctx: Context) -> None:
         info["display"] = f"GPU {info.get('gpu')}: {info.get('utilization_percent')}%"
         return info
 
-    @reg.tool(risk="safe", group="system", final=True, keywords=("disk", "space", "storage", "drive", "free", "full", "capacity"))
+    @reg.tool(risk="safe", cache_ttl=60, group="system", final=True, keywords=("disk", "space", "storage", "drive", "free", "full", "capacity"))
     def get_disk_space() -> dict:
         """Free and used space on each drive."""
         drives = []

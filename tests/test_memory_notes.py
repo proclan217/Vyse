@@ -147,3 +147,10 @@ def test_save_routine_rejects_wrong_argument_names(ctx, registry):
         save("x", "y", [{"tool": "open_app", "args": {"name": "Clock", "bogus": 1}}])
     save("x", "y", [{"tool": "open_path", "args": {"path": "https://example.com"}}])
     assert ctx.memory.get_routine("x")["steps"][0]["args"] == {"path": "https://example.com"}
+
+
+def test_save_routine_accepts_flat_steps(ctx, registry):
+    registry.get("save_routine").fn("flat", "flat form", [{"tool": "open_app", "name": "notepad"},
+                                                         {"tool": "set_timer", "minutes": 5, "label": "x"}])
+    assert ctx.memory.get_routine("flat")["steps"] == [{"tool": "open_app", "args": {"name": "notepad"}},
+                                                       {"tool": "set_timer", "args": {"minutes": 5, "label": "x"}}]

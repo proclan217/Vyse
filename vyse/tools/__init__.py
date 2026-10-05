@@ -11,10 +11,10 @@ if TYPE_CHECKING:
 
 def build_registry(ctx: "Context", *, extra: bool = True) -> Registry:
     """Create a registry with all built-in tools. Optional integrations register only when configured."""
-    from . import files, memory_tools, notes, organize, routines, system, web
+    from . import automation, files, memory_tools, notes, organize, routines, system, web
 
     reg = Registry()
-    for mod in (files, organize, notes, memory_tools, routines, web, system):
+    for mod in (files, organize, notes, memory_tools, routines, automation, web, system):
         mod.register(reg, ctx)
     if extra:
         from . import google, mcp_client

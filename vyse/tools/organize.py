@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..context import Context
+from ..organize_rules import build_rule_plan, rules_for
 from ..policy import ALLOW, CONFIRM, Decision
 from .files import resolve_path
 from .registry import Registry, ToolError
@@ -27,7 +28,7 @@ CATEGORIES: dict[str, set[str]] = {
 }
 EXT_TO_CAT = {e: c for c, exts in CATEGORIES.items() for e in exts}
 SKIP_SUFFIXES = {".crdownload", ".part", ".tmp", ".partial", ".download", ".lnk", ".ini"}
-Strategy = Literal["by_type", "by_date", "by_name"]
+Strategy = Literal["by_rules", "by_type", "by_date", "by_name"]
 
 
 def category_for(p: Path, strategy: str) -> str:
@@ -38,11 +39,13 @@ def category_for(p: Path, strategy: str) -> str:
     if strategy == "by_name":
         c = p.name[:1].upper()
         return c if c.isalpha() else "0-9 & symbols"
-    raise ToolError(f"Unknown strategy '{strategy}'. Use by_type, by_date or by_name.")
+    raise ToolError(f"Unknown strategy '{strategy}'. Use by_rules, by_type, by_date or by_name.")
 
 
-def build_plan(folder: Path, strategy: str) -> list[dict[str, str]]:
+def build_plan(folder: Path, strategy: str, rules: list | None = None) -> list[dict[str, str]]:
     """Pure function: compute proposed moves for the files directly inside `folder`. Touches nothing."""
+    if strategy == "by_rules":      # deterministic rules (config [[organize.rules]] or the built-in defaults)
+        return build_rule_plan(folder, rules_for(rules), catch_all="Other")
     moves = []
     for p in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
         if not p.is_file() or p.name.startswith(".") or p.name.startswith("~$") or p.suffix.lower() in SKIP_SUFFIXES:
@@ -82,17 +85,17 @@ def register(reg: Registry, ctx: Context) -> None:
 
     @reg.tool(risk="safe", group="organize", keywords=("organize", "organise", "clean", "tidy", "sort", "folder", "downloads", "desktop", "mess"),
               assess=lambda a: pol.check_path(resolve_path(a.get("folder", "")), write=False))
-    def plan_organize(folder: str, strategy: Strategy = "by_type") -> dict:
+    def plan_organize(folder: str, strategy: Strategy = "by_rules") -> dict:
         """Create a DRY-RUN plan for organizing the files in a folder into sub-folders. Nothing is changed. Show the plan to the user, then use apply_plan.
 
         Args:
             folder: Folder to organize, e.g. 'Downloads' or a full path.
-            strategy: How to group files: by_type (Images, Documents...), by_date (YYYY-MM) or by_name (first letter).
+            strategy: by_rules (default: deterministic rules from config, e.g. screenshots, invoices, installers), by_type (Images, Documents...), by_date (YYYY-MM) or by_name (first letter).
         """
         f = resolve_path(folder)
         if not f.is_dir():
             raise ToolError(f"Not a folder: {f}")
-        moves = build_plan(f, strategy)
+        moves = build_plan(f, strategy, ctx.cfg.organize_rules)
         if not moves:
             return {"plan_id": None, "moves": 0, "display": f"Nothing to organize in {f.name}"}
         plan = {"id": uuid.uuid4().hex[:8], "folder": str(f), "strategy": strategy, "moves": moves, "created": time.time()}
@@ -141,10 +144,34 @@ def register(reg: Registry, ctx: Context) -> None:
                 "verified": verified, "undo": "Use undo_last to revert.",
                 "display": f"Moved {len(moved)} file(s)" + (f", {len(failed)} failed" if failed else "") + (" — verified" if verified else " — NOT fully verified")}
 
-    @reg.tool(risk="write", group="organize", keywords=("undo", "revert", "rollback", "restore", "back", "oops"))
-    def undo_last() -> dict:
-        """Undo the most recent file operation batch (a move, organize run, copy, folder creation or trash)."""
-        done, problems = ctx.journal.undo_last()
+    def _undone(done: list[str], problems: list[str]) -> dict:
         return {"reverted": len(done), "details": done[:20], "problems": problems,
                 "verified": not problems and bool(done),
                 "display": f"Reverted {len(done)} item(s)" + (f"; {len(problems)} problem(s)" if problems else "")}
+
+    @reg.tool(risk="write", group="organize", keywords=("undo", "revert", "rollback", "restore", "back", "oops"))
+    def undo_last() -> dict:
+        """Undo the most recent file operation batch (a move, organize run, copy, folder creation or trash)."""
+        return _undone(*ctx.journal.undo_last())
+
+    @reg.tool(risk="write", group="organize", keywords=("undo", "revert", "rollback", "restore", "back", "oops", "steps", "transaction"))
+    def undo(steps: int = 1, transaction: str = "") -> dict:
+        """Undo several recent file operations, or one specific transaction from undo_history.
+
+        Args:
+            steps: How many of the most recent transactions to undo (default 1).
+            transaction: A transaction id from undo_history (overrides steps).
+        """
+        return _undone(*ctx.journal.undo(steps=max(1, min(int(steps), 20)), batch=transaction.strip() or None))
+
+    @reg.tool(risk="safe", group="organize", final=True, keywords=("undo", "history", "log", "transactions", "changes", "did", "recent"))
+    def undo_history(limit: int = 10) -> dict:
+        """List recent reversible file operations (the transaction log) and whether each can still be undone.
+
+        Args:
+            limit: How many transactions to show (default 10).
+        """
+        rows = ctx.journal.history(limit=max(1, min(int(limit), 50)))
+        out = [{"transaction": r["batch"], "when": time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"])),
+                "what": r["summary"], "files": r["files"], "undone": r["undone"]} for r in rows]
+        return {"transactions": out, "display": f"{len(out)} transaction(s)" if out else "No file operations recorded yet"}

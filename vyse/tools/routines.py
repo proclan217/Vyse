@@ -16,7 +16,7 @@ def register(reg: Registry, ctx: Context) -> None:
     mem = ctx.memory
 
     def save_routine(name: str, description: str, steps: list[dict]) -> dict:
-        """Save a named routine: an ordered list of tool calls to run LATER with run_routine. Use this when the user is teaching or saving a setup ('save a routine', 'study session = ...', 'when I say X do Y'); do NOT perform the steps now. Reusing a name replaces it.
+        """Save a named routine: an ordered list of tool calls to run LATER with run_routine. Use this when the user is teaching or saving a setup ('save a routine', 'study session = ...', 'when I say X do Y'); do NOT perform the steps now. Use the exact links/names the user gave or that appear in remembered facts; never invent URLs or placeholder ids (ask_user if one is missing). Reusing a name replaces it.
 
         Args:
             name: Short name, e.g. 'study session'.
@@ -25,13 +25,16 @@ def register(reg: Registry, ctx: Context) -> None:
         """
         if not steps:
             raise ToolError("A routine needs at least one step.")
-        from ..agent import validate_args       # same validation a live call gets
+        from ..validation import validate_args  # same validation a live call gets
         clean = []
         for i, s in enumerate(steps, 1):
             tool = reg.get(str(s.get("tool", "")))
             if tool is None or tool.name in _NO_NEST:
-                raise ToolError(f"Step {i}: unknown or not allowed tool '{s.get('tool')}'.")
-            args = s.get("args") or {}
+                names = ', '.join(t.name for t in reg.all() if t.name not in _NO_NEST)
+                raise ToolError(f"Step {i}: unknown or not allowed tool '{s.get('tool')}'. Available tools: {names}.")
+            # Flat form {"tool": "open_app", "name": "Clock"} (easiest for small models) or nested {"tool":..., "args": {...}}.
+            args = s["args"] if "args" in s else {k: v for k, v in s.items() if k != "tool"}
+            args = args or {}
             if not isinstance(args, dict):
                 raise ToolError(f"Step {i}: args must be an object.")
             checked, err = validate_args(tool, args)
@@ -49,10 +52,13 @@ def register(reg: Registry, ctx: Context) -> None:
             parameters={"type": "object", "required": ["name", "description", "steps"], "properties": {
                 "name": {"type": "string", "description": "Short name, e.g. 'study session'."},
                 "description": {"type": "string", "description": "One sentence on what it does."},
-                "steps": {"type": "array", "description": "Ordered tool calls to run.", "items": {
-                    "type": "object", "required": ["tool"], "properties": {
-                        "tool": {"type": "string", "description": "Tool name, e.g. open_app, open_path, set_timer, close_app."},
-                        "args": {"type": "object", "description": "Arguments for that tool, e.g. {\"name\": \"Clock\"} or {\"minutes\": 25}."}}}}}})
+                "steps": {"type": "array", "description": (
+                    "Ordered tool calls. Each step is the tool name plus that tool's own arguments as sibling keys, e.g. "
+                    "{\"tool\": \"open_app\", \"name\": \"Clock\"}, {\"tool\": \"set_timer\", \"minutes\": 25, \"label\": \"study\"}, "
+                    "{\"tool\": \"open_path\", \"path\": \"https://...\"}, {\"tool\": \"close_app\", \"name\": \"Valorant\"}. "
+                    "Fill every required argument."), "items": {
+                        "type": "object", "required": ["tool"], "additionalProperties": True,
+                        "properties": {"tool": {"type": "string", "description": "Tool name, e.g. open_app, open_path, set_timer, close_app."}}}}}})
 
     @reg.tool(risk="safe", group="routines", final=True,
               keywords=("routine", "session", "mode", "start", "begin", "run", "setup", "workflow", "go"))

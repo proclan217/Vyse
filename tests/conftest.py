@@ -28,6 +28,8 @@ def cfg(tmp_path: Path) -> Config:
         agent=AgentConfig(max_steps=5, history_messages=6, summarize_after=8),
     )
     c.organize_confirm_threshold = 5
+    c.app_scan = False            # hermetic: never scan the real Start Menu in tests
+    c.index.enabled = False        # tests that need the file index build their own
     c.apps = {"notepad": AppEntry("notepad", ["notepad"], path="notepad.exe", process="notepad.exe")}
     return c
 
